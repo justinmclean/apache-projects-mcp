@@ -11,6 +11,7 @@ const BASE_URL = "https://projects.apache.org/json";
 // ---------------------------------------------------------------------------
 
 const cache = {};
+const cacheStatus = {};
 const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 hours
 
 const DATA_SOURCES = {
@@ -31,13 +32,36 @@ async function getData(key) {
   const url = DATA_SOURCES[key];
   if (!url) throw new Error(`Unknown data source: ${key}`);
 
-  const resp = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!resp.ok) {
-    throw new Error(`Failed to fetch ${key}: HTTP ${resp.status}`);
+  cacheStatus[key] = {
+    ...(cacheStatus[key] || {}),
+    lastAttempt: now,
+    lastError: null,
+  };
+
+  try {
+    const resp = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    const refreshedAt = Date.now();
+    cache[key] = { data, ts: refreshedAt };
+    cacheStatus[key] = {
+      ...(cacheStatus[key] || {}),
+      lastAttempt: now,
+      lastSuccess: refreshedAt,
+      lastError: null,
+    };
+    return data;
+  } catch (e) {
+    cacheStatus[key] = {
+      ...(cacheStatus[key] || {}),
+      lastAttempt: now,
+      lastFailure: Date.now(),
+      lastError: e.message || String(e),
+    };
+    throw new Error(`Failed to fetch ${key}: ${e.message || e}`);
   }
-  const data = await resp.json();
-  cache[key] = { data, ts: now };
-  return data;
 }
 
 // Warm all caches
@@ -66,6 +90,28 @@ function matchesQuery(text, query) {
 function truncateList(items, max = 50) {
   if (items.length <= max) return { items, truncated: false };
   return { items: items.slice(0, max), truncated: true, total: items.length };
+}
+
+function formatTimestamp(ts) {
+  return ts ? new Date(ts).toISOString() : "never";
+}
+
+function formatAge(ts, now = Date.now()) {
+  if (!ts) return "n/a";
+
+  const seconds = Math.max(0, Math.floor((now - ts) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours < 48) return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return remainingHours ? `${days}d ${remainingHours}h` : `${days}d`;
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +551,45 @@ server.tool(
 
     if (truncated) {
       lines.push(`\n... showing ${max} of ${total}.`);
+    }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// --- Tool: get_data_status --------------------------------------------------
+server.tool(
+  "get_data_status",
+  "Show cache and upstream fetch status for each Apache project data source.",
+  {},
+  async () => {
+    const now = Date.now();
+    const lines = [];
+    lines.push("# Data Status");
+    lines.push("");
+    lines.push(`Cache TTL: ${formatAge(now - CACHE_TTL, now)}`);
+    lines.push("");
+
+    for (const key of Object.keys(DATA_SOURCES)) {
+      const cached = cache[key];
+      const status = cacheStatus[key] || {};
+      const hasCachedData = Boolean(cached);
+      const cacheAge = hasCachedData ? formatAge(cached.ts, now) : "n/a";
+      const stale = hasCachedData ? (now - cached.ts) >= CACHE_TTL : true;
+      const lastRefresh = status.lastSuccess || (cached && cached.ts);
+      const lastResult = status.lastError ? "failure" : status.lastSuccess ? "success" : "not fetched";
+
+      lines.push(`- **${key}**`);
+      lines.push(`  URL: ${DATA_SOURCES[key]}`);
+      lines.push(`  Cached: ${hasCachedData ? "yes" : "no"} | Age: ${cacheAge} | Stale: ${stale ? "yes" : "no"}`);
+      lines.push(`  Last attempt: ${formatTimestamp(status.lastAttempt)}`);
+      lines.push(`  Last refresh: ${formatTimestamp(lastRefresh)} | Last result: ${lastResult}`);
+      if (status.lastFailure) {
+        lines.push(`  Last failure: ${formatTimestamp(status.lastFailure)}`);
+      }
+      if (status.lastError) {
+        lines.push(`  Error: ${status.lastError}`);
+      }
     }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };

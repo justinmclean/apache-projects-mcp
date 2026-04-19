@@ -134,6 +134,35 @@ function findProjectOverviewTarget(committees, podlings, id) {
   return null;
 }
 
+function findProjectSuggestions(committees, podlings, id) {
+  const key = normalizeProjectId(id);
+  const committeeMatches = committees
+    .filter(
+      (c) =>
+        (c.id || "").includes(key) ||
+        (c.group || "").includes(key) ||
+        (c.name || "").toLowerCase().includes(key)
+    )
+    .map((c) => c.id);
+  const podlingMatches = Object.entries(podlings)
+    .filter(
+      ([podlingId, p]) =>
+        podlingId.toLowerCase().includes(key) ||
+        (p.name || "").toLowerCase().includes(key)
+    )
+    .map(([podlingId]) => podlingId);
+
+  return [...committeeMatches, ...podlingMatches].slice(0, 10);
+}
+
+function formatProjectNotFound(id, committees, podlings) {
+  const suggestions = findProjectSuggestions(committees, podlings, id);
+  if (suggestions.length > 0) {
+    return `Project "${id}" not found. Similar project IDs: ${suggestions.join(", ")}.`;
+  }
+  return `Project "${id}" not found.`;
+}
+
 function matchesProjectRepository(name, target) {
   const lower = name.toLowerCase();
   const candidates = new Set([
@@ -153,6 +182,27 @@ function matchesProjectRepository(name, target) {
   }
 
   return false;
+}
+
+function enrichMembers(members, names) {
+  return (members || [])
+    .map((uid) => ({
+      uid,
+      name: names[uid] || uid,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function addMemberSection(lines, title, members) {
+  lines.push(`## ${title} (${members.length})`);
+  if (members.length === 0) {
+    lines.push("None found.");
+    return;
+  }
+
+  for (const member of members) {
+    lines.push(`- ${member.name} (${member.uid})`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,29 +331,11 @@ server.tool(
 
     const target = findProjectOverviewTarget(committees, podlings, id);
     if (!target) {
-      const key = normalizeProjectId(id);
-      const committeeMatches = committees
-        .filter(
-          (c) =>
-            (c.id || "").includes(key) ||
-            (c.group || "").includes(key) ||
-            (c.name || "").toLowerCase().includes(key)
-        )
-        .map((c) => c.id);
-      const podlingMatches = Object.entries(podlings)
-        .filter(
-          ([podlingId, p]) =>
-            podlingId.toLowerCase().includes(key) ||
-            (p.name || "").toLowerCase().includes(key)
-        )
-        .map(([podlingId]) => podlingId);
-      const suggestions = [...committeeMatches, ...podlingMatches].slice(0, 10);
-
-      const text =
-        suggestions.length > 0
-          ? `Project "${id}" not found. Similar project IDs: ${suggestions.join(", ")}.`
-          : `Project "${id}" not found.`;
-      return { content: [{ type: "text", text }] };
+      return {
+        content: [
+          { type: "text", text: formatProjectNotFound(id, committees, podlings) },
+        ],
+      };
     }
 
     const pmcGroupName = `${target.groupBase}-pmc`;
@@ -345,6 +377,54 @@ server.tool(
         lines.push(`- **${release.name}** — ${release.date}`);
       }
     }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// --- Tool: get_project_people ----------------------------------------------
+server.tool(
+  "get_project_people",
+  "Get the people involved in an Apache project: PMC members, committers, " +
+    "and counts for each group.",
+  {
+    id: z.string().describe(
+      "Project ID (e.g. 'iceberg', 'httpd', 'spark')"
+    ),
+  },
+  async ({ id }) => {
+    const committees = await getData("committees");
+    const podlings = await getData("podlings");
+    const groups = await getData("groups");
+    const names = await getData("people_name");
+
+    const target = findProjectOverviewTarget(committees, podlings, id);
+    if (!target) {
+      return {
+        content: [
+          { type: "text", text: formatProjectNotFound(id, committees, podlings) },
+        ],
+      };
+    }
+
+    const pmcGroupName = `${target.groupBase}-pmc`;
+    const committerGroupName = target.groupBase;
+    const pmcMembers = enrichMembers(groups[pmcGroupName], names);
+    const committers = enrichMembers(groups[committerGroupName], names);
+
+    const lines = [];
+    lines.push(`# ${target.name} People`);
+    lines.push("");
+    lines.push(`- **Canonical ID:** ${target.id}`);
+    lines.push(`- **Type:** ${target.type}`);
+    lines.push(`- **PMC group name:** ${pmcGroupName}`);
+    lines.push(`- **PMC member count:** ${pmcMembers.length}`);
+    lines.push(`- **Committer group name:** ${committerGroupName}`);
+    lines.push(`- **Committer count:** ${committers.length}`);
+    lines.push("");
+    addMemberSection(lines, "PMC Members", pmcMembers);
+    lines.push("");
+    addMemberSection(lines, "Committers", committers);
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }

@@ -134,6 +134,93 @@ function truncateList(items, max = 50) {
   return { items: items.slice(0, max), truncated: true, total: items.length };
 }
 
+function normalizeProjectId(id) {
+  return id.trim().toLowerCase();
+}
+
+function cleanText(text) {
+  return (text || "").replace(/\s+/g, " ").trim();
+}
+
+function getReleaseDate(info) {
+  return typeof info === "string" ? info : info.date || "";
+}
+
+function getRecentReleases(releases, projectId, max = 5) {
+  const projectReleases = releases[projectId];
+  if (!projectReleases) return [];
+
+  return Object.entries(projectReleases)
+    .map(([name, info]) => ({
+      name,
+      date: getReleaseDate(info) || "unknown",
+    }))
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, max);
+}
+
+function findProjectOverviewTarget(committees, podlings, id) {
+  const key = normalizeProjectId(id);
+
+  const committee = committees.find(
+    (c) =>
+      c.id === key ||
+      c.group === key ||
+      (c.name || "").toLowerCase() === key
+  );
+  if (committee) {
+    return {
+      type: "committee",
+      id: committee.id,
+      name: committee.name,
+      description: committee.shortdesc || "",
+      homepage: committee.homepage || "",
+      chair: committee.chair || "",
+      groupBase: committee.group || committee.id,
+    };
+  }
+
+  for (const [podlingId, podling] of Object.entries(podlings)) {
+    if (
+      podlingId.toLowerCase() === key ||
+      (podling.name || "").toLowerCase() === key
+    ) {
+      return {
+        type: "podling",
+        id: podlingId,
+        name: podling.name || podlingId,
+        description: podling.description || "",
+        homepage: podling.homepage || "",
+        chair: "",
+        groupBase: podlingId,
+      };
+    }
+  }
+
+  return null;
+}
+
+function matchesProjectRepository(name, target) {
+  const lower = name.toLowerCase();
+  const candidates = new Set([
+    target.id.toLowerCase(),
+    target.groupBase.toLowerCase(),
+  ]);
+
+  for (const candidate of candidates) {
+    if (
+      lower === candidate ||
+      lower.startsWith(`${candidate}-`) ||
+      lower.startsWith(`${candidate}_`) ||
+      lower.startsWith(`${candidate}.`)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function formatTimestamp(ts) {
   return ts ? new Date(ts).toISOString() : "never";
 }
@@ -167,6 +254,98 @@ function makeTextResponse(text) {
   return {
     content: [{ type: "text", text }],
   };
+}
+
+function makeProjectOverviewResponse({ id, committees, podlings, groups, repos, releases }) {
+  const target = findProjectOverviewTarget(committees, podlings, id);
+  if (!target) {
+    const key = normalizeProjectId(id);
+    const committeeMatches = committees
+      .filter(
+        (c) =>
+          (c.id || "").includes(key) ||
+          (c.group || "").includes(key) ||
+          (c.name || "").toLowerCase().includes(key)
+      )
+      .map((c) => c.id);
+    const podlingMatches = Object.entries(podlings)
+      .filter(
+        ([podlingId, p]) =>
+          podlingId.toLowerCase().includes(key) ||
+          (p.name || "").toLowerCase().includes(key)
+      )
+      .map(([podlingId]) => podlingId);
+    const suggestions = [...committeeMatches, ...podlingMatches].slice(0, 10);
+
+    const text =
+      suggestions.length > 0
+        ? `Project "${id}" not found. Similar project IDs: ${suggestions.join(", ")}.`
+        : `Project "${id}" not found.`;
+    return makeResponse(text, {
+      query: id,
+      found: false,
+      suggestions,
+    });
+  }
+
+  const pmcGroupName = `${target.groupBase}-pmc`;
+  const committerGroupName = target.groupBase;
+  const pmcMembers = groups[pmcGroupName];
+  const committers = groups[committerGroupName];
+  const repoMatches = Object.entries(repos)
+    .filter(([name]) => matchesProjectRepository(name, target))
+    .sort(([a], [b]) => a.localeCompare(b));
+  const recentReleases = getRecentReleases(releases, target.id);
+  const description = cleanText(target.description) || null;
+  const repositories = repoMatches.map(([name, url]) => ({ name, url }));
+
+  const lines = [];
+  lines.push(`# ${target.name}`);
+  lines.push("");
+  lines.push(`- **Canonical ID:** ${target.id}`);
+  lines.push(`- **Type:** ${target.type}`);
+  lines.push(`- **Short description:** ${description || "N/A"}`);
+  lines.push(`- **Homepage:** ${target.homepage || "N/A"}`);
+  lines.push(`- **Chair:** ${target.chair || "N/A"}`);
+  lines.push(`- **PMC group name:** ${pmcGroupName}`);
+  lines.push(`- **PMC member count:** ${pmcMembers ? pmcMembers.length : "N/A"}`);
+  lines.push(`- **Committer group name:** ${committerGroupName}`);
+  lines.push(`- **Committer count:** ${committers ? committers.length : "N/A"}`);
+  lines.push("");
+  lines.push(`## Repositories (${repositories.length})`);
+  if (repositories.length === 0) {
+    lines.push("No repositories found.");
+  } else {
+    for (const repo of repositories) {
+      lines.push(`- **${repo.name}**: ${repo.url}`);
+    }
+  }
+  lines.push("");
+  lines.push(`## Recent Releases (${recentReleases.length})`);
+  if (recentReleases.length === 0) {
+    lines.push("No releases found.");
+  } else {
+    for (const release of recentReleases) {
+      lines.push(`- **${release.name}** — ${release.date}`);
+    }
+  }
+
+  return makeResponse(lines.join("\n"), {
+    query: id,
+    found: true,
+    id: target.id,
+    name: target.name,
+    type: target.type,
+    description,
+    homepage: target.homepage || null,
+    chair: target.chair || null,
+    pmcGroupName,
+    pmcMemberCount: pmcMembers ? pmcMembers.length : null,
+    committerGroupName,
+    committerCount: committers ? committers.length : null,
+    repositories,
+    recentReleases,
+  });
 }
 
 function getDataStatus({
@@ -365,6 +544,27 @@ server.tool(
       charter: c.charter || null,
       roster,
     });
+  }
+);
+
+// --- Tool: get_project_overview --------------------------------------------
+server.tool(
+  "get_project_overview",
+  "Get the important ASF information about a project in one summary: identity, " +
+    "homepage, chair, group names and counts, repositories, and recent releases.",
+  {
+    id: z.string().describe(
+      "Project ID (e.g. 'iceberg', 'httpd', 'spark')"
+    ),
+  },
+  async ({ id }) => {
+    const committees = await getData("committees");
+    const podlings = await getData("podlings");
+    const groups = await getData("groups");
+    const repos = await getData("repositories");
+    const releases = await getData("releases");
+
+    return makeProjectOverviewResponse({ id, committees, podlings, groups, repos, releases });
   }
 );
 
@@ -836,4 +1036,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   await server.connect(transport);
 }
 
-export { getDataStatus, makeResponse, makeTextResponse };
+export { getDataStatus, makeProjectOverviewResponse, makeResponse, makeTextResponse };
